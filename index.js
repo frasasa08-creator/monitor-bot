@@ -2,6 +2,7 @@
 require('dotenv').config();
 const { Client, GatewayIntentBits, EmbedBuilder } = require('discord.js');
 const express = require('express');
+const axios = require('axios');
 
 const client = new Client({
     intents: [
@@ -20,7 +21,9 @@ const config = {
     checkInterval: parseInt(process.env.CHECK_INTERVAL) || 10000,
     guildId: process.env.GUILD_ID,
     adminUserId: process.env.ADMIN_USER_ID,
-    port: parseInt(process.env.PORT) || 3001
+    port: parseInt(process.env.PORT) || 3001,
+    renderHealthCheckUrl: process.env.RENDER_HEALTH_CHECK_URL,
+    renderPingInterval: parseInt(process.env.RENDER_PING_INTERVAL) || 30000
 };
 
 // Verifica che tutte le variabili siano presenti
@@ -39,7 +42,8 @@ let mainBotStatus = {
     lastSeen: null,
     uptime: 0,
     startedAt: Date.now(),
-    lastChange: null
+    lastChange: null,
+    monitorStartTime: Date.now()
 };
 
 client.once('ready', async () => {
@@ -52,6 +56,7 @@ client.once('ready', async () => {
     await findExistingStatusMessage();
     startMonitoring();
     startWebServer();
+    startKeepAlive(); // Avvia il keep-alive per Render
 });
 
 // CERCA IL MESSAGGIO DI STATUS ESISTENTE
@@ -130,6 +135,25 @@ async function startMonitoring() {
             console.error('❌ Errore nel monitoring:', error);
         }
     }, config.checkInterval);
+}
+
+// KEEP-ALIVE PER RENDER.COM
+function startKeepAlive() {
+    if (!config.renderHealthCheckUrl) {
+        console.log('ℹ️  URL health check non configurato, skip keep-alive');
+        return;
+    }
+
+    setInterval(async () => {
+        try {
+            const response = await axios.get(`${config.renderHealthCheckUrl}?ping=${Date.now()}`);
+            console.log(`🟢 Keep-alive ping inviato: ${response.status} ${response.statusText}`);
+        } catch (error) {
+            console.log('⚠️  Keep-alive ping fallito:', error.message);
+        }
+    }, config.renderPingInterval);
+
+    console.log(`🟢 Keep-alive attivo ogni ${config.renderPingInterval/1000} secondi`);
 }
 
 function createStatusEmbed(mainBotMember, isOnline, statusChanged) {
@@ -217,10 +241,36 @@ function formatUptime(ms) {
     return `${seconds}s`;
 }
 
-// WEB SERVER PER LA DASHBOARD
+// WEB SERVER PER LA DASHBOARD CON HEALTH CHECK
 function startWebServer() {
     app.use(express.json());
 
+    // HEALTH CHECK ENDPOINT (per Render.com)
+    app.get('/health', (req, res) => {
+        const botStatus = client.isReady() ? 'connected' : 'disconnected';
+        const uptime = Date.now() - mainBotStatus.monitorStartTime;
+        
+        res.status(200).json({
+            status: 'ok',
+            timestamp: new Date().toISOString(),
+            bot: {
+                status: botStatus,
+                uptime: formatUptime(uptime),
+                readyAt: client.readyAt ? client.readyAt.toISOString() : null
+            },
+            monitor: {
+                mainBotOnline: mainBotStatus.online,
+                lastCheck: mainBotStatus.lastSeen,
+                uptime: formatUptime(uptime)
+            },
+            memory: {
+                used: `${(process.memoryUsage().heapUsed / 1024 / 1024).toFixed(2)} MB`,
+                total: `${(process.memoryUsage().heapTotal / 1024 / 1024).toFixed(2)} MB`
+            }
+        });
+    });
+
+    // ENDPOINT STATUS API
     app.get('/api/status', (req, res) => {
         res.json({
             online: mainBotStatus.online,
@@ -228,10 +278,12 @@ function startWebServer() {
             uptime: mainBotStatus.uptime,
             lastChange: mainBotStatus.lastChange,
             monitorUptime: Date.now() - mainBotStatus.startedAt,
-            timestamp: new Date().toISOString()
+            timestamp: new Date().toISOString(),
+            discordStatus: client.isReady() ? 'connected' : 'disconnected'
         });
     });
 
+    // DASHBOARD
     app.get('/dashboard', (req, res) => {
         res.send(`
             <!DOCTYPE html>
@@ -247,10 +299,18 @@ function startWebServer() {
                     .status-badge { padding: 5px 10px; border-radius: 4px; font-weight: bold; }
                     .online-badge { background: #00ff00; color: black; }
                     .offline-badge { background: #ff0000; color: white; }
+                    .health-check { background: #2d2d2d; padding: 10px; border-radius: 5px; margin: 10px 0; }
                 </style>
             </head>
             <body>
                 <h1>🤖 Dashboard Status Bot</h1>
+                
+                <div class="health-check">
+                    <strong>Health Check:</strong> 
+                    <a href="/health" target="_blank">/health</a> | 
+                    <a href="/api/status" target="_blank">/api/status</a>
+                </div>
+                
                 <div class="card">
                     <h2>
                         <span class="status-badge ${mainBotStatus.online ? 'online-badge' : 'offline-badge'}">
@@ -258,17 +318,25 @@ function startWebServer() {
                         </span>
                     </h2>
                     <p><strong>Ultimo check:</strong> ${new Date().toLocaleString()}</p>
-                    <p><strong>Uptime:</strong> ${formatUptime(mainBotStatus.uptime)}</p>
+                    <p><strong>Uptime Bot:</strong> ${formatUptime(mainBotStatus.uptime)}</p>
                     <p><strong>Monitor attivo da:</strong> ${formatUptime(Date.now() - mainBotStatus.startedAt)}</p>
                     <p><strong>Ultimo cambiamento:</strong> ${mainBotStatus.lastChange ? mainBotStatus.lastChange.toLocaleString() : 'Nessuno'}</p>
+                    <p><strong>Status Monitor:</strong> <span style="color: #00ff00;">🟢 ATTIVO</span></p>
                 </div>
             </body>
             </html>
         `);
     });
 
+    // ROOT REDIRECT TO DASHBOARD
+    app.get('/', (req, res) => {
+        res.redirect('/dashboard');
+    });
+
     app.listen(config.port, () => {
-        console.log(`🌐 Dashboard disponibile su http://localhost:${config.port}/dashboard`);
+        console.log(`🌐 Server web avviato sulla porta ${config.port}`);
+        console.log(`🏥 Health check disponibile su http://localhost:${config.port}/health`);
+        console.log(`📊 Dashboard disponibile su http://localhost:${config.port}/dashboard`);
     });
 }
 
