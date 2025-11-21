@@ -4,8 +4,10 @@ module.exports = {
     name: 'discord-monitor-bot',
     script: './index.js',
     
-    // CONFIGURAZIONE BASE
+    // USA FORK MODE INVECE DI CLUSTER
+    exec_mode: 'fork',
     instances: 1,
+    
     autorestart: true,
     watch: false,
     max_memory_restart: '500M',
@@ -15,19 +17,15 @@ module.exports = {
       NODE_ENV: 'production',
       PORT: 3001
     },
+    env_production: {
+      NODE_ENV: 'production',
+      PORT: 3001
+    },
     
-    // CONFIGURAZIONE LOG
+    // LOG PATH RELATIVI
     log_file: './logs/combined.log',
-    out_file: './logs/out.log',
+    out_file: './logs/out.log', 
     error_file: './logs/error.log',
-    time: true,
-    
-    // RESTART STRATEGIES
-    min_uptime: '10s',
-    max_restarts: 10,
-    restart_delay: 4000,
-    
-    // MONITORING PM2
-    exp_backoff_restart_delay: 100
+    time: true
   }]
 };
