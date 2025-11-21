@@ -53,10 +53,17 @@ client.once('ready', async () => {
     console.log(`   - Canale Status: ${config.statusChannelId}`);
     console.log(`   - Check ogni: ${config.checkInterval}ms`);
     
-    await findExistingStatusMessage();
-    startMonitoring();
+    // PRIMA avvia il server web (IMPORTANTE per Render)
     startWebServer();
-    startKeepAlive(); // Avvia il keep-alive per Render
+    
+    // POI aspetta 3 secondi che il server web sia pronto
+    setTimeout(async () => {
+        await findExistingStatusMessage();
+        startMonitoring();
+        startKeepAlive(); // Avvia il keep-alive per Render
+        
+        console.log('🔄 Tutti i servizi avviati con successo');
+    }, 3000);
 });
 
 // CERCA IL MESSAGGIO DI STATUS ESISTENTE
@@ -137,23 +144,59 @@ async function startMonitoring() {
     }, config.checkInterval);
 }
 
-// KEEP-ALIVE PER RENDER.COM
+// KEEP-ALIVE PER RENDER.COM - VERSIONE MIGLIORATA
 function startKeepAlive() {
     if (!config.renderHealthCheckUrl) {
         console.log('ℹ️  URL health check non configurato, skip keep-alive');
         return;
     }
 
-    setInterval(async () => {
-        try {
-            const response = await axios.get(`${config.renderHealthCheckUrl}?ping=${Date.now()}`);
-            console.log(`🟢 Keep-alive ping inviato: ${response.status} ${response.statusText}`);
-        } catch (error) {
-            console.log('⚠️  Keep-alive ping fallito:', error.message);
-        }
-    }, config.renderPingInterval);
+    const healthCheckUrl = `${config.renderHealthCheckUrl}/health`;
+    console.log(`🟢 Keep-alive configurato per: ${healthCheckUrl}`);
 
-    console.log(`🟢 Keep-alive attivo ogni ${config.renderPingInterval/1000} secondi`);
+    // Aspetta 10 secondi prima del primo ping per dare tempo al server di avviarsi
+    setTimeout(() => {
+        // Test iniziale
+        axios.get(healthCheckUrl, { timeout: 15000 })
+            .then(response => {
+                console.log(`✅ Health check iniziale riuscito: ${response.status}`);
+            })
+            .catch(error => {
+                console.log(`⚠️  Health check iniziale fallito: ${error.message}`);
+            });
+
+        // Interval regolare
+        const keepAliveInterval = setInterval(async () => {
+            try {
+                const response = await axios.get(`${healthCheckUrl}?ping=${Date.now()}&source=keepalive`, {
+                    timeout: 15000,
+                    headers: {
+                        'User-Agent': 'Discord-Monitor-Bot/1.0'
+                    }
+                });
+                
+                if (response.status === 200) {
+                    console.log(`🟢 Keep-alive ping riuscito (${response.data.status})`);
+                } else {
+                    console.log(`🟡 Keep-alive risposta: ${response.status}`);
+                }
+            } catch (error) {
+                if (error.code === 'ECONNREFUSED') {
+                    console.log('🔴 Keep-alive: Server non raggiungibile');
+                } else if (error.response) {
+                    // Server rispose ma con errore
+                    console.log(`🟡 Keep-alive: ${error.response.status} ${error.response.statusText}`);
+                } else if (error.code === 'ETIMEDOUT') {
+                    console.log('🟡 Keep-alive: Timeout');
+                } else {
+                    console.log('🟡 Keep-alive errore:', error.message);
+                }
+            }
+        }, config.renderPingInterval);
+
+        console.log(`🟢 Keep-alive attivo ogni ${config.renderPingInterval/1000} secondi`);
+
+    }, 10000); // Ritardo iniziale di 10 secondi
 }
 
 function createStatusEmbed(mainBotMember, isOnline, statusChanged) {
@@ -247,29 +290,56 @@ function startWebServer() {
 
     // HEALTH CHECK ENDPOINT (per Render.com)
     app.get('/health', (req, res) => {
-        const botStatus = client.isReady() ? 'connected' : 'disconnected';
-        const uptime = Date.now() - mainBotStatus.monitorStartTime;
-        
-        res.status(200).json({
-            status: 'ok',
-            timestamp: new Date().toISOString(),
-            bot: {
-                status: botStatus,
+        try {
+            const botStatus = client.isReady() ? 'connected' : 'disconnected';
+            const uptime = Date.now() - mainBotStatus.monitorStartTime;
+            const memoryUsage = process.memoryUsage();
+            
+            const healthData = {
+                status: 'ok',
+                timestamp: new Date().toISOString(),
                 uptime: formatUptime(uptime),
-                readyAt: client.readyAt ? client.readyAt.toISOString() : null
-            },
-            monitor: {
-                mainBotOnline: mainBotStatus.online,
-                lastCheck: mainBotStatus.lastSeen,
-                uptime: formatUptime(uptime)
-            },
-            memory: {
-                used: `${(process.memoryUsage().heapUsed / 1024 / 1024).toFixed(2)} MB`,
-                total: `${(process.memoryUsage().heapTotal / 1024 / 1024).toFixed(2)} MB`
+                bot: {
+                    status: botStatus,
+                    readyAt: client.readyAt ? client.readyAt.toISOString() : null,
+                    guilds: client.guilds.cache.size,
+                    ping: client.ws.ping
+                },
+                monitor: {
+                    mainBotOnline: mainBotStatus.online,
+                    lastCheck: mainBotStatus.lastSeen,
+                    lastChange: mainBotStatus.lastChange
+                },
+                system: {
+                    memory: {
+                        used: `${(memoryUsage.heapUsed / 1024 / 1024).toFixed(2)} MB`,
+                        total: `${(memoryUsage.heapTotal / 1024 / 1024).toFixed(2)} MB`
+                    },
+                    uptime: process.uptime(),
+                    version: process.version
+                },
+                request: {
+                    source: req.query.source || 'direct',
+                    ping: req.query.ping || null
+                }
+            };
+    
+            // Se il bot Discord non è connesso, ritorna 503
+            if (!client.isReady()) {
+                healthData.status = 'degraded';
+                healthData.message = 'Bot Discord non connesso';
+                return res.status(503).json(healthData);
             }
-        });
+    
+            res.status(200).json(healthData);
+        } catch (error) {
+            res.status(500).json({
+                status: 'error',
+                error: error.message,
+                timestamp: new Date().toISOString()
+            });
+        }
     });
-
     // ENDPOINT STATUS API
     app.get('/api/status', (req, res) => {
         res.json({
